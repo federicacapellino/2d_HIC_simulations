@@ -51,7 +51,7 @@ end
 
 
 
-@inbounds function dn_dpdx(fo,m,coords,eta,pT, phi_p, eta_p)
+@inbounds function dn_dpdx(fo,m::Float64,coords,eta,pT, phi_p, eta_p)
     field = fo.fields
     fields_on_coords = field(coords...)
     T = fields_on_coords[1]
@@ -104,10 +104,9 @@ end
     m = particle_species.mass
     charge = particle_species.charge
     deg = particle_species.degeneracy
-    f1 = particle_species.fj[1] #.. access Fj of particle
+    f1 = particle_species.fj[1] 
     f2 = particle_species.fj[2]
-    #.. access Fj of particle
-
+    
     @inbounds α = fields_on_coords[8]
     pμ_up = pmu_up(m, pT, phi_p, eta_p, eta)
     #f_eq = fun(dot(pμ_up,uμ_down)/T)*exp(charge*α)
@@ -125,7 +124,7 @@ function increment(list)
        return de
 end
 
-function dvn_dp_list_delta(fo,species_list, eta_p, wavenum_list; eta_min=-5.0, eta_max=5.0)
+function dvn_dp_list_delta(fo, species_list, eta_p, wavenum_list; eta_min=-5.0, eta_max=5.0)
 
     #uniform pt grid
     pTlists = pt_list.(species_list)
@@ -133,6 +132,7 @@ function dvn_dp_list_delta(fo,species_list, eta_p, wavenum_list; eta_min=-5.0, e
     domain = ([Fluidum.leftbounds(fo.x)...,eta_min,0.,-1.],[Fluidum.rightbounds(fo.x)...,eta_max,2pi,+1.])
 
     pt_length_max = maximum(length.(pt_list.(species_list)))
+
     function f(y,u,p) 
         fo, species_list, eta_p, wavenum_m = p
         @inbounds for k in eachindex(species_list)
@@ -141,7 +141,7 @@ function dvn_dp_list_delta(fo,species_list, eta_p, wavenum_list; eta_min=-5.0, e
             delta_list = delta_lists[k]
             @inbounds for i in eachindex(pTlist)
                 delta = delta_list[i]
-                pT = u[5]*delta + pTlist[i] #mapping from [0,1] to [pTlist[i]-delta, pTlist[i]+delta]
+                pT = u[5]*delta + pTlist[i] #mapping from [-1,1] to [pTlist[i]-delta, pTlist[i]+delta]
                 denom=dn_dpdx(fo,species,(u[1],u[2]),u[3],pT, u[4], eta_p)*pT 
                 @inbounds for j in eachindex(wavenum_list)
                     wavenum_m=wavenum_list[j]
@@ -161,56 +161,75 @@ function dvn_dp_list_delta(fo,species_list, eta_p, wavenum_list; eta_min=-5.0, e
 end
 
 
-function spectra_event(result::ObservableResult,species_list)
-    pTlists = pt_list.(species_list)
-    pt_length_max = maximum(length.(pt_list.(species_list)))
-    glauber, vn = result.glauber_multiplicity, result.vn
-    spectra_result = zeros(pt_length_max,length(species_list))
-    for k in eachindex(species_list)
-        pTlist = pTlists[k]
-        for i in eachindex(pTlist)
-            spectra_result[i,k] = vn[3,i,1,k]
-        end
-    end
-    return spectra_result
-end
-
-function spectra(event_list,species_list)
-    pTlists = pt_list.(species_list)
-    pt_length_max = maximum(length.(pt_list.(species_list)))
-    spectra_result = zeros(pt_length_max,length(species_list))
-    for result in event_list
-        vn = result.vn 
-        for k in eachindex(species_list)
-            pTlist = pTlists[k]
-            for i in eachindex(pTlist)
-                spectra_result[i,k] += vn[3,i,1,k]/length(event_list)
-            end
-        end
-    end
-    return spectra_result
-end
-
-"""
-multiplicity_event(result::ObservableResult,species_list)
-
-
-returns the total multiplicity M of all charged particles and identified particles in the species list for a given event result
-"""
-function multiplicity_event(result ::ObservableResult,species_list)
+function spectra(result::ObservableResult)
     vn = result.vn
-    pTlists = pt_list.(species_list)
+    return vn[3,:,1,:]
+end
+
+function spectra(result::Vector{ObservableResult})
+    return spectra.(result)
+end
+
+function spectra(result::Vector{Vector{ObservableResult}})
+    return spectra.(result)
+end
+
+function spectra_average(result::Vector{ObservableResult})
+    return mean(spectra.(result))
+end
+
+function spectra_average(result::Vector{Vector{ObservableResult}})
+    return mean.(spectra.(result))
+end
+
+
+function multiplicity(result::ObservableResult)
+    vn = result.vn
     M = 0.
-    M_species = zeros(length(species_list))
-    for k in eachindex(species_list)
-        pTlist = pTlists[k]
-        for i in eachindex(pTlist)
+    M_species = zeros(length(axes(vn,4)))
+    for k in axes(vn,4)
+        for i in axes(vn,2)
             M+=vn[3,i,1,k] 
             M_species[k]+=vn[3,i,1,k]
         end
     end
     return (total_multiplicity = M, identified_multiplicity = M_species)
 end
+
+function multiplicity(result::Vector{ObservableResult})
+    return multiplicity.(result)
+end
+
+function multiplicity(result::Vector{Vector{ObservableResult}})
+    return multiplicity.(result)
+end
+
+function get_total_multiplicity(mult_cc)
+    getproperty.(mult_cc, :total_multiplicity)
+end
+
+function get_identified_multiplicity(mult_cc, part_spec_idx::Int)
+    getindex.(getproperty.(mult_cc, :identified_multiplicity), part_spec_idx)
+end
+
+function get_identified_multiplicity(mult_cc, part_spec::Vector)
+    id_mult = zeros(length(part_spec),length(mult_cc))
+    for k in eachindex(part_spec)
+        for ev in eachindex(mult_cc)
+        id_mult[k,ev]= getproperty(mult_cc[ev], :identified_multiplicity)[k]
+    end
+end
+    return id_mult
+end
+
+function total_multiplicity_average(total_mult::Vector)
+    return mean(total_mult)
+end
+
+function identified_multiplicity_average(id_mult::Matrix)
+    return mean(id_mult,dims=2)
+end
+
 
 """
 q_vector_event_pt_dependent(result::ObservableResult,species_list, wavenum_list)

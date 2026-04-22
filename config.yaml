@@ -12,8 +12,8 @@
 
   "charm parameter":
 
-    dσ_QQdy: 0.4087 # in mb
-    σ_in: 70.0 # in mb
+    dσ_QQdy: 0.0457 # in mb
+    σ_in: 7.00  # in mb
 
   "initial conditions":
     
@@ -22,9 +22,9 @@
     n1: Lead()
     n2: Lead()
     w: 0.5
-    k: 1.
+    k: 10.
     p: 0.
-    b: "minBias" #options: tuple (bmin, bmax) or "minBias"
+    b: (3.,3.) #options: tuple (bmin, bmax) or "minBias"
   
   "additional parameters": # please don't change if you don't know what you're doing
     
@@ -34,9 +34,9 @@
 
 "run parameter":
   
-  Nev: 10000
-  checkpoint_interval: 500
-  checkpoint_file: "event_by_event_results_debug_all_particle.h5"
+  Nev: 1
+  checkpoint_interval: 1
+  checkpoint_file: "event_by_event_D0_debug.h5"
   gridpoints: 100
   xmax: 20.0 # fm
   wavenum: [2,3]
