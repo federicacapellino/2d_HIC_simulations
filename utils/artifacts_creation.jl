@@ -6,7 +6,7 @@ artifact_toml = joinpath(@__DIR__, "Artifacts.toml")
 add_artifact!(
     "Artifacts.toml",
     "kernels",
-    "https://github.com/federicacapellino/2d_hic_simulation/releases/download/v1.0.0/fastreso_Fj_kernels.tar.gz",
+    "https://github.com/federicacapellino/2d_hic_simulations/releases/download/v1.0.0/fastreso_Fj_kernels.tar.gz",
     force = true,
 )
 
