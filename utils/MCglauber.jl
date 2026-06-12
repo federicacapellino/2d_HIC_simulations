@@ -35,7 +35,7 @@ end
 
 function ncoll_fluctuating_thickness(x::Num1, y::Num2, f::Participant{T, S, V, M, C, D, F}, N1::Int, N2::Int, σin::Float64) where {Num1 <: Real, Num2 <: Real, T, S, V, M, C, D, F}
 
-    part1 = f.part1
+    part1 = f.part1 #already includes the impact parameter shift
     part2 = f.part2
     shape1 = f.shape1
     shape2 = f.shape2
@@ -48,7 +48,7 @@ function ncoll_fluctuating_thickness(x::Num1, y::Num2, f::Participant{T, S, V, M
     @inbounds @fastmath for i in eachindex(part1)
         pa_x, pa_y = part1[i]
         ga = shape1[i]
-        ta +=  ga * MonteCarloGlauber.Tp(x - pa_x, y - pa_y, w) #TODO check this shift
+        ta +=  ga * MonteCarloGlauber.Tp(x - pa_x, y - pa_y, w) 
     end
 
     @inbounds @fastmath for i in eachindex(part2)
@@ -57,8 +57,29 @@ function ncoll_fluctuating_thickness(x::Num1, y::Num2, f::Participant{T, S, V, M
         tb += ga * MonteCarloGlauber.Tp(x - pa_x, y - pa_y, w)
     end
 
-    return σin*N1*N2*mean2(ta, tb)/length(part1)/length(part2) #norm((ta,tb),p)
+    return σin*ta*tb 
 end
+
+
+function T_A(x::Num1, y::Num2, f::Participant{T, S, V, M, C, D, F}) where {Num1 <: Real, Num2 <: Real, T, S, V, M, C, D, F}
+
+    part1 = f.part1 #already includes the impact parameter shift
+    shape1 = f.shape1
+    w = f.sub_nucleon_width
+   
+    ta = zero(eltype(f))
+   
+    @inbounds @fastmath for i in eachindex(part1)
+        pa_x, pa_y = part1[i]
+        ga = shape1[i]
+        ta +=  ga * MonteCarloGlauber.Tp(x - pa_x, y - pa_y, w) 
+    end
+
+    return ta
+end
+
+# hcubature(b->T_A(b[1],b[2],event),(-20.0, -20.0), (20.0, 20.0), rtol=1e-3, atol=1e-3) == Npart_A
+
 
 @inline function mean2(a, b)
     return a * b
@@ -78,13 +99,11 @@ function nhard_profile_(event, discretization, N1, N2, σin, norm; offset = 0.00
     return ncoll_map.*norm .+ offset
 end
 
-function fug_(event, discretization, N1, N2, σin, norm, eos; offset = 0.001)   
-    
+function fug_(event, discretization, N1, N2, σin, dσ_QQdy, tau0, eos; offset = 10e-5)   
+    ccbar_norm = 2. /tau0/σ_in*dσ_QQdy
     fug_map = map(zip(discretization.grid,profile)) do x
-        nhard_= 2. *ncoll_fluctuating_thickness(x[1][1], x[1][2], event, N1, N2, σin)*norm + offset
-        #if nhard_ < thermodynamic(x[2],0.0,eos.hadron_list).pressure
-        fvalue = log((nhard_)/(thermodynamic(x[2],0.0,eos.hadron_list).pressure))
-
+        nhard_= ncoll_fluctuating_thickness(x[1][1], x[1][2], event, N1, N2, σin) * ccbar_norm
+        log((nhard_+ offset)/(thermodynamic(x[2],0.0,eos.hadron_list).pressure+offset))
     end
 
     return fug_map
