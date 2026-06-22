@@ -1,0 +1,8 @@
+# Name           Mass       Gamma    deg    Spin    Isospin    I3     Nq      Ns    Naq      Nas       Nc        Nac      MC
+
+# non-strange D-mesons
+#Dc1865zer     1.5    0.0000000   6      0.5      0      0.    0.       0.     1.      0.        1.        0.     4 
+Dc1865zer    1.8646    0.0000000   1      0.0      0.5      0.5    0.       0.     1.      0.        1.        0.     421 
+#jp3096zer    3.09687    0.0000000    3      1.0      0.       0.     0.       0.     0.      0.        1.        0.     443
+
+
