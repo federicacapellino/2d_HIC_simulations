@@ -107,7 +107,7 @@ function cons_to_primitive(U, eos)
     prob = NonlinearProblem(cons_to_primitive_rhds, u0, cons)
     sol = solve(prob, SNLS.SimpleNewtonRaphson())
     if SciMLBase.successful_retcode(sol.retcode) == false || T <= 1e-5 || isnan(T) || isnan(μ)
-        @warn "cons to primitive is failing"
+#        @warn "cons to primitive is failing"
         T_atmo = 1e-5
         return T_atmo, T_atmo, 0.0, 0.0
     end
@@ -191,6 +191,7 @@ function rel_rhs!(du, u, eos, dx, dy)
         (UL, UR) -> rusanov_flux(eos, UL, UR, 2), conserved_cell, add_conserved!)
     return du
 end
+#=
 function rhs!(du, u, params, t)
     eos, dx, dy = params
     fill!(du, 0.0)
@@ -229,7 +230,7 @@ function rhs!(du, u, params, t)
 
     return nothing
 end
-
+=#
 function ssprk2_step!(u, u1, du, eos, dt, dx, dy)
     rel_rhs!(du, u, eos, dx, dy)
     @. u1 = u + dt * du
@@ -238,7 +239,7 @@ function ssprk2_step!(u, u1, du, eos, dt, dx, dy)
     return u
 end
 
-function ssprk2_step!(u, u1, du, eos, dt, dx, dy)
+#=function ssprk2_step!(u, u1, du, eos, dt, dx, dy)
     params = (eos, dx, dy)
     
     # --- STAGE 1 ---
@@ -297,7 +298,7 @@ function diagnostics(u, eos, dx, dy)
         vmax    = max(vmax, sqrt(vx^2 + vy^2))
     end
     return charge, energy, vmax
-end
+end=#
 
 function probe_n(u, eos, i, j)
     d = parent(u)
@@ -389,11 +390,7 @@ function get_primitive_variables(u, eos)
     dE  = interior_view(u.E)
 
     # 2. Allocate output matrices matching the physical grid dimensions
-    ny, nx = size(dN)
-    T_grid  = Matrix{Float64}(undef, ny, nx)
-    μ_grid  = Matrix{Float64}(undef, ny, nx)
-    vx_grid = Matrix{Float64}(undef, ny, nx)
-    vy_grid = Matrix{Float64}(undef, ny, nx)
+
 
     # 3. Fast column-major iteration loop over the physical domain
     @inbounds for j in 1:nx
@@ -415,7 +412,6 @@ function get_primitive_variables(u, eos)
     # Return as a clean, easily accessible NamedTuple
     return (T = T_grid, μ = μ_grid, vx = vx_grid, vy = vy_grid)
 end
-
 
 #=
 function run_2d_ideal_charge_diffeq(eos, T_init, μ_init; cfl=0.3, t_end=0.20)
@@ -540,3 +536,94 @@ function prim_from_cons(eos, U; maxit=500, tol=1.0e-11)
 end
 
 =#
+
+using StaticArrays
+using LinearAlgebra
+
+using Printf
+using StaticArrays
+
+function verify_2x2_conservation(eos)
+    println("==================================================")
+    println("  RUNNING 2x2 HYDRODYNAMICS FLUX DISCRETIZATION TEST")
+    println("==================================================")
+    
+    n = 2
+    dx = 1.0 / n
+    dy = 1.0 / n
+
+    # Initialize a 2x2 grid using your actual LocalMultiHaloArray allocation scheme
+    # Halo width = 1, boundary condition = :repeating
+    u  = LocalMultiHaloArray(Float64, (n, n), 1;
+        fields=(:N, :Mx, :My, :E), boundary_condition=:repeating)
+    du = similar(u)
+
+    # Populate the 2x2 cells with an asymmetric high-pressure spot at cell (1,1)
+    # to guarantee non-zero fluxes across all inner and outer periodic faces.
+    for j in 1:n, i in 1:n
+        if i == 1 && j == 1
+            # "Spark" cell primitives -> converted to conserved
+            U = prim_to_cons(0.3, 0.5, 0.1, -0.1, eos)
+        else
+            # "Atmosphere" cells
+            U = prim_to_cons(0.1, 0.1, 0.0, 0.0, eos)
+        end
+        interior_view(u.N)[i, j]  = U[1]
+        interior_view(u.Mx)[i, j] = U[2]
+        interior_view(u.My)[i, j] = U[3]
+        interior_view(u.E)[i, j]  = U[4]
+    end
+
+    # Run your code's actual halo wrapping logic
+    synchronize_halo!(u)
+
+    # Compute spatial derivatives/flux divergence updates across the grid using your exact RHS routine
+    rel_rhs!(du, u, eos, dx, dy)
+
+    # Extract raw structural arrays including the halo buffers to check totals
+    pN  = parent(du).N
+    pMx = parent(du).Mx
+    pMy = parent(du).My
+    pE  = parent(du).E
+
+    # Check total sums across the entire memory structure (including halos)
+    total_sum_N  = sum(pN)
+    total_sum_Mx = sum(pMx)
+    total_sum_My = sum(pMy)
+    total_sum_E  = sum(pE)
+
+    # Check sums strictly within the active domain region (ignoring halos)
+    # Since n=2 and halo=1, interior slices are rows/cols 2:3
+    interior_sum_N  = sum(pN[2:3, 2:3])
+    interior_sum_Mx = sum(pMx[2:3, 2:3])
+    interior_sum_My = sum(pMy[2:3, 2:3])
+    interior_sum_E  = sum(pE[2:3, 2:3])
+
+    @printf("\n--- GLOBAL PARENT MEMORY STORAGE SUMS ---\n")
+    @printf("  Total N Array Sum : %+.15e\n", total_sum_N)
+    @printf("  Total E Array Sum : %+.15e\n", total_sum_E)
+    @printf("  Total Mx Array Sum: %+.15e\n", total_sum_Mx)
+    @printf("  Total My Array Sum: %+.15e\n", total_sum_My)
+
+    @printf("\n--- ACTIVE INTERIOR PHYSICAL DOMAIN SUMS ---\n")
+    @printf("  Interior N Sum    : %+.15e\n", interior_sum_N)
+    @printf("  Interior E Sum    : %+.15e\n", interior_sum_E)
+    @printf("  Interior Mx Sum   : %+.15e\n", interior_sum_Mx)
+    @printf("  Interior My Sum   : %+.15e\n", interior_sum_My)
+
+    println("\n================ DIAGNOSTIC REPORT ================")
+    if abs(interior_sum_E) < 1e-13 && abs(interior_sum_N) < 1e-13
+        println("  ✓ SUCCESS: Your active interior cells balance to machine precision.")
+        println("             No matter changes, global conservation laws will hold perfectly.")
+    elseif abs(total_sum_E) < 1e-13 && abs(interior_sum_E) > 1e-13
+        println("  ✗ FAILURE: The complete memory array balances out, but your active")
+        println("             interior domain is leaking values into the ghost rows/columns.")
+        println("             This confirms boundary fluxes are overwritten by `synchronize_halo!`.")
+    else
+        println("  ✗ FAILURE: Even the raw memory buffer arrays do not balance to zero.")
+        println("             Check your `accumulate_flux_divergence!` loop layout; it is likely")
+        println("             miscounting or dropping face loops entirely.")
+    end
+    println("===================================================\n")
+end
+

@@ -1,5 +1,6 @@
 using Fluidum
 using MonteCarloGlauber
+
 using HaloArrays
 using Printf
 using StaticArrays
@@ -43,6 +44,7 @@ include("../utils/observables.jl")
 include("../utils/fastreso.jl")
 #include("../utils/finite_volume.jl")
 include("../utils/finite_volum_diffeq.jl")
+include("../utils/finite_volum_diffeq_multithread.jl")
 
 # the convention here are T, ux, uy, piyy, pizz, pixy, piB this has to match with the matrix defined
 twod_visc_hydro = Fields(
@@ -217,147 +219,19 @@ end
     return dp_dT / (T * d2p_dT2)
 end
  #we define some random intial condition 
-function temperature(r)
-       0.4(1+0.3)/(exp(abs(r))+1 )+0.01
+
+#this now takes a long time
+#sol = run_2d_ideal_charge_diffeq(eos,tmap, μmap, t_end=.6, cfl =0.1)
+sol = run_2d_ideal_charge_diffeq(eos,tmap[60:80,60:80], μmap[60:80,60:80], t_end=.6, cfl =0.1)
+
+#alternatively
+
+phi = map(Iterators.product((-1:0.1:1),(-1:0.1:1))) do I
+    x,y = Tuple(I)
+    0.4(1+0.3)/(exp(abs(x^2+y^2)/0.1))+1e-4
 end
-#we set the array corresponding to the temperature 
-phi=Fluidum.set_array((x,y)->temperature(hypot(x,y)),:temperature,twod_visc_hydro_discrete);
-heatmap(phi[4,60:80,60:80])
-heatmap(interior_view(sol[1][:,:]))
+phi
+heatmap(phi)
 
-phi[1,70:75,70:75]
-zeros(10,10)
-run_2d_ideal_charge(eos,phi[1,70:75,70:75], 0. *phi[1,70:75,70:75], t_end=.6, cfl =0.1)
-
-sol = run_2d_ideal_charge_diffeq(eos,tmap[60:80,60:80], μmap[60:80,60:80], t_end=2., cfl =0.3)
-sol
-final_fields = similar(tmap)
-final_fields = get_primitive_variables(sol,eos)
-
-heatmap(final_fields.T[:,:])
-heatmap(final_fields.vx[:,:])
-heatmap(final_fields.vy[:,:])
-heatmap(final_fields.μ[:,:])
-
-heatmap(interior_view(sol[4][:,:]))
-maximum(interior_view(sol[1][:,:]))
-maximum(interior_view(sol[4][:,:]))
-
-maximum(phi[1,60:80,60:80])
-using StaticArrays
-using LinearAlgebra
-
-using Printf
-using StaticArrays
-
-function verify_2x2_conservation(eos)
-    println("==================================================")
-    println("  RUNNING 2x2 HYDRODYNAMICS FLUX DISCRETIZATION TEST")
-    println("==================================================")
-    
-    n = 2
-    dx = 1.0 / n
-    dy = 1.0 / n
-
-    # Initialize a 2x2 grid using your actual LocalMultiHaloArray allocation scheme
-    # Halo width = 1, boundary condition = :repeating
-    u  = LocalMultiHaloArray(Float64, (n, n), 1;
-        fields=(:N, :Mx, :My, :E), boundary_condition=:repeating)
-    du = similar(u)
-
-    # Populate the 2x2 cells with an asymmetric high-pressure spot at cell (1,1)
-    # to guarantee non-zero fluxes across all inner and outer periodic faces.
-    for j in 1:n, i in 1:n
-        if i == 1 && j == 1
-            # "Spark" cell primitives -> converted to conserved
-            U = prim_to_cons(0.3, 0.5, 0.1, -0.1, eos)
-        else
-            # "Atmosphere" cells
-            U = prim_to_cons(0.1, 0.1, 0.0, 0.0, eos)
-        end
-        interior_view(u.N)[i, j]  = U[1]
-        interior_view(u.Mx)[i, j] = U[2]
-        interior_view(u.My)[i, j] = U[3]
-        interior_view(u.E)[i, j]  = U[4]
-    end
-
-    # Run your code's actual halo wrapping logic
-    synchronize_halo!(u)
-
-    # Compute spatial derivatives/flux divergence updates across the grid using your exact RHS routine
-    rel_rhs!(du, u, eos, dx, dy)
-
-    # Extract raw structural arrays including the halo buffers to check totals
-    pN  = parent(du).N
-    pMx = parent(du).Mx
-    pMy = parent(du).My
-    pE  = parent(du).E
-
-    # Check total sums across the entire memory structure (including halos)
-    total_sum_N  = sum(pN)
-    total_sum_Mx = sum(pMx)
-    total_sum_My = sum(pMy)
-    total_sum_E  = sum(pE)
-
-    # Check sums strictly within the active domain region (ignoring halos)
-    # Since n=2 and halo=1, interior slices are rows/cols 2:3
-    interior_sum_N  = sum(pN[2:3, 2:3])
-    interior_sum_Mx = sum(pMx[2:3, 2:3])
-    interior_sum_My = sum(pMy[2:3, 2:3])
-    interior_sum_E  = sum(pE[2:3, 2:3])
-
-    @printf("\n--- GLOBAL PARENT MEMORY STORAGE SUMS ---\n")
-    @printf("  Total N Array Sum : %+.15e\n", total_sum_N)
-    @printf("  Total E Array Sum : %+.15e\n", total_sum_E)
-    @printf("  Total Mx Array Sum: %+.15e\n", total_sum_Mx)
-    @printf("  Total My Array Sum: %+.15e\n", total_sum_My)
-
-    @printf("\n--- ACTIVE INTERIOR PHYSICAL DOMAIN SUMS ---\n")
-    @printf("  Interior N Sum    : %+.15e\n", interior_sum_N)
-    @printf("  Interior E Sum    : %+.15e\n", interior_sum_E)
-    @printf("  Interior Mx Sum   : %+.15e\n", interior_sum_Mx)
-    @printf("  Interior My Sum   : %+.15e\n", interior_sum_My)
-
-    println("\n================ DIAGNOSTIC REPORT ================")
-    if abs(interior_sum_E) < 1e-13 && abs(interior_sum_N) < 1e-13
-        println("  ✓ SUCCESS: Your active interior cells balance to machine precision.")
-        println("             No matter changes, global conservation laws will hold perfectly.")
-    elseif abs(total_sum_E) < 1e-13 && abs(interior_sum_E) > 1e-13
-        println("  ✗ FAILURE: The complete memory array balances out, but your active")
-        println("             interior domain is leaking values into the ghost rows/columns.")
-        println("             This confirms boundary fluxes are overwritten by `synchronize_halo!`.")
-    else
-        println("  ✗ FAILURE: Even the raw memory buffer arrays do not balance to zero.")
-        println("             Check your `accumulate_flux_divergence!` loop layout; it is likely")
-        println("             miscounting or dropping face loops entirely.")
-    end
-    println("===================================================\n")
-end
-
-verify_2x2_conservation(eos)
-
-n = size(temperature_map,1)
-dx = 1.0 / n;  dy = 1.0 / n
-# Allocate physical variables and Runge-Kutta workspaces
-u  = LocalMultiHaloArray(Float64, (n, n), 1;
-    fields=(:N, :Mx, :My, :E), boundary_condition=:repeating)
-u1 = similar(u)
-du = similar(u)
-# Convert primitive variables to conserved variables and populate the grid
-for j in 1:n, i in 1:n
-    T = temperature_map[i, j]
-    μ = μ_map[i, j]
-    
-    # Initial condition assumes zero initial fluid velocity (vx=0, vy=0)
-    U = cons_from_prim(eos, T, μ, 0.0, 0.0)
-    
-    interior_view(u.N)[i, j]  = U[1]
-    interior_view(u.Mx)[i, j] = U[2]
-    interior_view(u.My)[i, j] = U[3]
-    interior_view(u.E)[i, j]  = U[4]
-end
-synchronize_halo!(u)
-
-
-#why NaN here?
-q0, e0, _ = diagnostics(u, eos, dx, dy)
+sol = run_2d_ideal_charge_diffeq(eos,phi, 0. *phi, t_end=.6, cfl =0.1)
+sol = run_2d_ideal_charge_diffeq_threaded(eos,tmap[60:70,60:70], μmap[60:70,60:70], t_end=.6, cfl =0.3)
