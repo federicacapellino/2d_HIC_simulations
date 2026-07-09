@@ -44,7 +44,7 @@ include("../utils/observables.jl")
 include("../utils/fastreso.jl")
 #include("../utils/finite_volume.jl")
 include("../utils/finite_volum_diffeq.jl")
-include("../utils/finite_volum_diffeq_multithread.jl")
+#include("../utils/finite_volum_diffeq_multithread.jl")
 
 # the convention here are T, ux, uy, piyy, pizz, pixy, piB this has to match with the matrix defined
 twod_visc_hydro = Fields(
@@ -161,7 +161,7 @@ begin
 end
 
 
-tmap, nhardmap, fugmap, μmap = MCGlauber_to_fields(event, discretization, σ_in,dσ_QQdy,tau0,eos, offset=1e-4)
+tmap, nhardmap, fugmap, μmap = MCGlauber_to_fields(event, discretization, σ_in, dσ_QQdy,tau0,eos, offset=1e-4)
 
 heatmap(tmap)
 heatmap(nhardmap)
@@ -173,11 +173,10 @@ maximum(tmap)
 minimum(μmap)
 minimum(tmap)
 
-tmap
 maximum(fugmap)
 isinf.(fugmap)
 
-ncoll_int=hcubature(b->ncoll_fluctuating_thickness(b[1],b[2],event,σ_in),(-20.0, -20.0), (20.0, 20.0), rtol=1e-3, atol=1e-3)
+ncoll_int=hcubature(b->σ_in*MonteCarloGlauber.ncoll_fluctuating_thickness(b[1],b[2],event),(-20.0, -20.0), (20.0, 20.0), rtol=1e-3, atol=1e-3)
 ncoll_event    
 
 ccbar_norm = 2. /tau0/σ_in*dσ_QQdy
@@ -208,7 +207,7 @@ end
 
 @inline charge_density(T,α,eos) = thermodynamic(T,α,eos.hadron_list).pressure
 @inline fluid_pressure(T,eos) = Fluidum.pressure(T,eos)
-@inline fluid_energy_density(T,eos) = T*Fluidum.pressure_derivative(T,Val(1),eos) - p
+@inline fluid_energy_density(T,eos) = T*Fluidum.pressure_derivative(T,Val(1),eos) - fluid_pressure(T,eos)
 @inline enthalpy_density(T,eos) = fluid_energy_density(T,eos) + fluid_pressure(T,eos)
 @inline sound_speed_sq(eos) = 1. / 3.            # c_s² = 1/3
 @inline function sound_speed_sq(T, eos)
@@ -228,7 +227,7 @@ sol = run_2d_ideal_charge_diffeq(eos,tmap[60:80,60:80], μmap[60:80,60:80], t_en
 
 phi = map(Iterators.product((-1:0.1:1),(-1:0.1:1))) do I
     x,y = Tuple(I)
-    0.4(1+0.3)/(exp(abs(x^2+y^2)/0.1))+1e-4
+    0.4*(1+0.3)/(exp(abs(x^2+y^2)/0.1))+1e-4
 end
 phi
 heatmap(phi)

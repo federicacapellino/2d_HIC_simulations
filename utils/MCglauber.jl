@@ -52,7 +52,7 @@ function T_A(x::Num1, y::Num2, f::Participant{T, S, V, M, C, D, F}) where {Num1 
 end
 
 # hcubature(b->T_A(b[1],b[2],event),(-20.0, -20.0), (20.0, 20.0), rtol=1e-3, atol=1e-3) == Npart_A
-
+#=
 function ncoll_fluctuating_thickness(x::Num1, y::Num2, f::Participant{T, S, V, M, C, D, F}, σin::Float64) where {Num1 <: Real, Num2 <: Real, T, S, V, M, C, D, F}
 
     part1 = f.part1 #already includes the impact parameter shift
@@ -79,7 +79,7 @@ function ncoll_fluctuating_thickness(x::Num1, y::Num2, f::Participant{T, S, V, M
     return σin*ta*tb 
 end
 
-
+=#
 function MCGlauber_to_fields(event, discretization, σin, dσ_QQdy, tau0, eos; offset = 10e-5, norm = 10, exp_tail = false, xgrid = -10:0.5:10, ygrid = -10:0.5:10, kwarg...)
     
     profile = map(discretization.grid) do y
@@ -87,13 +87,13 @@ function MCGlauber_to_fields(event, discretization, σin, dσ_QQdy, tau0, eos; o
     event(y...)
     end
 
-    ccbar_norm = 2. /tau0/σ_in*dσ_QQdy
+    ccbar_norm = 2. /tau0*dσ_QQdy
 
     temperature_profile = InverseFunction(x->pressure_derivative(x,Val(1),eos)).(norm.*profile) .+ offset
     
     nhard_profile = map(discretization.grid) do I
         x,y = Tuple(I)
-        ncoll_fluctuating_thickness(x, y, event, σin) * ccbar_norm
+        MonteCarloGlauber.ncoll_fluctuating_thickness(x, y, event) * ccbar_norm
     end
 
     fugacity_profile = map(CartesianIndices(discretization.grid)) do I
