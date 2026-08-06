@@ -2,6 +2,8 @@ using StaticArrays: SVector
 import StaticArrays as SA
 using NonlinearSolve
 import SimpleNonlinearSolve as SNLS
+using LinearAlgebra: opnorm
+using Printf
 using Test
 
 # ==============================================================================
@@ -301,27 +303,95 @@ end
 init_dnmr_state(n::Integer; halo::Integer=1)  = init_state(n; halo=halo, viscous=true)
 init_ideal_state(n::Integer; halo::Integer=1) = init_state(n; halo=halo, viscous=false)
 
+# ─── Primitive recovery — shared step, threaded through the whole RHS ────────
+# Bundles cons_to_primitive's long return tuple so it's recovered once per cell and passed
+# around, instead of every downstream flux/source stub re-solving the same Newton problem.
+struct PrimitiveState
+    qx::Float64; qy::Float64; τ::Float64; a::Float64
+    Wlorentz::Float64; vx::Float64; vy::Float64
+    Temp::Float64; μ::Float64
+    p::Float64; eps::Float64; n::Float64
+    pi0x::Float64; pi0y::Float64; pi00::Float64; nu0::Float64
+end
+
+@inline function recover_primitives(C, DISSP, eos)
+    qx, qy, τ, a, Wl, vx, vy, Temp, μ, p, eps, n, pi0x, pi0y, pi00, nu0 =
+        cons_to_primitive(C, DISSP, eos)
+    return PrimitiveState(qx, qy, τ, a, Wl, vx, vy, Temp, μ, p, eps, n, pi0x, pi0y, pi00, nu0)
+end
+
+# A "full cell state" S = (C, prim, W): raw C-sector conserved densities, cached recovered
+# primitives, raw W-sector dissipative fields — everything a flux/source formula could need,
+# computed once and threaded through rather than re-derived inside each call. read_W is
+# dissipative_cell_W on the viscous grid, or a zero-fill on the ideal grid (no W-sector
+# fields to read at all) — see build_primitive_cache, which decides which one applies.
+const ZERO_W_STATE = SA.SVector{6}(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+@inline zero_dissipative_cell_W(d, I) = ZERO_W_STATE
+
+@inline full_cell(d, prim_cache, I, read_W) =
+    (conserved_cell_C(d, I), prim_cache[I], read_W(d, I))
+
+# Recovers primitives for every cell in the padded (ghost-inclusive) grid, once per RHS
+# evaluation — needed at ghost cells too, since domain-boundary faces read from them. Uses
+# field_storages(u), NOT parent(u): interior_faces/interior_range (used throughout this file
+# by accumulate_flux_divergence!/accumulate_path_conservative_W!/cfl_dt_full/diagnostics_full)
+# hand out storage-space (ghost-inclusive) CartesianIndices, while parent(u)'s per-field
+# arrays are sized/indexed logically (1:n) and throw a BoundsError on those — field_storages(u)
+# is the padded (n+2halo)-sized accessor that matches. Falls back to zero DISSP when u has no
+# W-sector fields (the ideal grid), so this one function serves both init_ideal_state and
+# init_dnmr_state grids. Also returns has_W so callers can build a matching full_cell reader
+# without re-checking propertynames themselves.
+function build_primitive_cache(u, eos)
+    d = field_storages(u)
+    has_W = :bulk in propertynames(u)
+    prim_cache = Array{PrimitiveState}(undef, size(d.C0))
+    for I in CartesianIndices(d.C0)
+        C = conserved_cell_C(d, I)
+        Wdiss = has_W ? dissipative_cell_W(d, I) : ZERO_W_STATE
+        prim_cache[I] = recover_primitives(C, Wdiss, eos)
+    end
+    return prim_cache, has_W
+end
+
 # ─── C-sector physical flux & wave speed — equations supplied later ──────────
-# U = (C0, Cx, Cy, Cn). dim: 1 = x-flux, 2 = y-flux. Kept as named stubs (rather than an
-# inlined flat-space formula) because C0,Cx,Cy,Cn fold in a √-g metric factor, so the actual
-# flux/wave-speed formulas need the geometric factors/source terms supplied separately.
-function physical_flux_C(eos, U, dim::Int)
+# S = (C, prim, W) at one cell/state, C=(C0,Cx,Cy,Cn). dim: 1 = x-flux, 2 = y-flux. Kept as
+# named stubs (rather than an inlined flat-space formula) because C0,Cx,Cy,Cn fold in a √-g
+# metric factor, so the actual flux/wave-speed formulas need the geometric factors/source
+# terms supplied separately.
+function physical_flux_C(eos, S, dim::Int)
     error("physical_flux_C: equations not yet supplied")
 end
 
-function max_wave_speed_C(eos, U, dim::Int)
-    error("max_wave_speed_C: equations not yet supplied")
+# flux_jacobian_C(eos, S, dim) -> 4x4 matrix, A(U) = ∂F_C/∂C. Entries supplied later.
+function flux_jacobian_C(eos, S, dim::Int)
+    error("flux_jacobian_C: equations not yet supplied")
+end
+
+# max_wave_speed_C: Sec VIII E, Eq. 104 — α(U) ≃ sqrt(‖A(U)‖_1 ‖A(U)‖_∞), a cheap upper bound
+# on the spectral radius via induced matrix norms (opnorm(A,1) = max column-abs-sum,
+# opnorm(A,Inf) = max row-abs-sum), avoiding an eigenvalue solve at every interface. Mechanical
+# once flux_jacobian_C is supplied — this function itself needs no further equations.
+@inline function max_wave_speed_C(eos, S, dim::Int)
+    A = flux_jacobian_C(eos, S, dim)
+    return sqrt(opnorm(A, 1) * opnorm(A, Inf))
 end
 
 # ─── Rusanov flux (Eq. 66) — fully mechanical, no physics assumptions ────────
-@inline function rusanov_flux_C(eos, UL, UR, dim::Int)
-    smax = max(max_wave_speed_C(eos, UL, dim), max_wave_speed_C(eos, UR, dim))
-    return 0.5 * (physical_flux_C(eos, UL, dim) + physical_flux_C(eos, UR, dim)) -
-           0.5 * smax * (UR - UL)
+# smax follows Eq. 104 literally: αLR ≃ sqrt(‖A(U*)‖_1 ‖A(U*)‖_∞) at the interface-averaged
+# state U* = (U_L+U_R)/2, not max(α(U_L), α(U_R)) — the two only coincide when α is linear in U.
+@inline function rusanov_flux_C(eos, SL, SR, dim::Int)
+    CL, CR = SL[1], SR[1]
+    WL, WR = SL[3], SR[3]
+    C_mid = 0.5 * (CL + CR)
+    W_mid = 0.5 * (WL + WR)
+    S_mid = (C_mid, recover_primitives(C_mid, W_mid, eos), W_mid)
+    smax = max_wave_speed_C(eos, S_mid, dim)
+    return 0.5 * (physical_flux_C(eos, SL, dim) + physical_flux_C(eos, SR, dim)) -
+           0.5 * smax * (CR - CL)
 end
 
-# ─── Field access for accumulate_flux_divergence! (C-sector only — untouched W-sector
-# fields, if present on the same LocalMultiHaloArray, are simply never referenced here) ──────
+# ─── Field access (C-sector only — untouched W-sector fields, if present on the same
+# LocalMultiHaloArray, are simply never referenced here) ──────────────────────
 @inline conserved_cell_C(d, I) = SVector(d.C0[I], d.Cx[I], d.Cy[I], d.Cn[I])
 
 @inline function add_conserved_C!(d, I, scale, U)
@@ -332,15 +402,23 @@ end
     return d
 end
 
-# ─── RHS (x then y sweep) ─────────────────────────────────────────────────────
+# ─── RHS (x then y sweep) — C-sector only, isolated single-sector testing ────
+# Primitives are always recovered assuming zero DISSP here (build_primitive_cache falls back
+# to that when u has no W-sector fields, but even called against init_dnmr_state's 10-field
+# grid this stays a pure C-sector-only evolution — use rhs_full! for the true coupled system.
 function rhs_C!(du, u, eos, dx, dy)
     fill!(du, 0.0)
     synchronize_halo!(u)
     fr = FaceRanges(u)
-    accumulate_flux_divergence!(parent(du), parent(u), fr, 1, inv(dx),
-        (UL, UR) -> rusanov_flux_C(eos, UL, UR, 1), conserved_cell_C, add_conserved_C!)
-    accumulate_flux_divergence!(parent(du), parent(u), fr, 2, inv(dy),
-        (UL, UR) -> rusanov_flux_C(eos, UL, UR, 2), conserved_cell_C, add_conserved_C!)
+    d = field_storages(u)
+    prim_cache, has_W = build_primitive_cache(u, eos)
+    read_W_fn = has_W ? dissipative_cell_W : zero_dissipative_cell_W
+    read_full = (data, I) -> full_cell(data, prim_cache, I, read_W_fn)
+
+    accumulate_flux_divergence!(field_storages(du), d, fr, 1, inv(dx),
+        (SL, SR) -> rusanov_flux_C(eos, SL, SR, 1), read_full, add_conserved_C!)
+    accumulate_flux_divergence!(field_storages(du), d, fr, 2, inv(dy),
+        (SL, SR) -> rusanov_flux_C(eos, SL, SR, 2), read_full, add_conserved_C!)
     return du
 end
 
@@ -350,5 +428,268 @@ function ssprk2_step_C!(u, u1, du, eos, dt, dx, dy)
     @. u1 = u + dt * du
     rhs_C!(du, u1, eos, dx, dy)
     @. u = 0.5 * u + 0.5 * (u1 + dt * du)
+    return u
+end
+
+# ─── W-sector path-conservative update (Eqs. 99, 100, 102) — equations later ─
+#
+# Sec VIII C keeps the two sectors structurally separate: the C-sector is a genuine balance
+# law (already handled above by rusanov_flux_C, no B-matrix), while the W-sector is purely
+# non-conservative, ∂_tW^a + B^{x,a}_B(U)∂_xU^B = S^a_W(U) (Eq. 101) — no flux term at all, so
+# unlike the generic Eq. 99 there's no F(U_R)-F(U_L) piece here, only the path integral.
+
+# path_integrand_W(eos, S_mid, ΔC, ΔW, dim) -> SVector{6}
+#   Straight-line, midpoint-quadrature approximation of Eq. 99's path integral
+#   N^a_LR = ∫_0^1 B^{x,a}_B(Φ(s)) ∂_sΦ^B ds ≈ B^{x,a}_B((U_L+U_R)/2) · ΔU^B, restricted to the
+#   W-sector: combines both the B_WC piece (C-gradients coupling in through the reconstructed
+#   u^μ, e.g. θ,σ^μν,ω^μν) and the B_WW piece (self-coupling of W-gradients) in one call.
+#   S_mid = full state (C,prim,W) recovered fresh at the face midpoint Φ(s=1/2); ΔC,ΔW =
+#   right-minus-left jumps. dim: 1=x, 2=y.
+function path_integrand_W(eos, S_mid, ΔC, ΔW, dim::Int)
+    error("path_integrand_W: equations not yet supplied")
+end
+
+# mixed_flux_jacobian(eos, S, dim) -> 10x10 matrix, A_eff (Eq. 105's block form:
+#   [[∂F_C/∂C, ∂F_C/∂W], [H∂q/∂C, G+H∂q/∂W]]) for the combined (C,W) state. Kept distinct from
+#   flux_jacobian_C since it must account for the B-matrix coupling, not just the C-sector flux
+#   Jacobian. Entries supplied later.
+function mixed_flux_jacobian(eos, S, dim::Int)
+    error("mixed_flux_jacobian: equations not yet supplied")
+end
+
+# max_wave_speed_W: Sec VIII E, Eq. 104/105 — same sqrt(‖A_eff‖_1 ‖A_eff‖_∞) norm-product bound
+# as max_wave_speed_C, applied to the mixed operator A_eff instead of the plain C-sector
+# Jacobian. Mechanical once mixed_flux_jacobian is supplied.
+@inline function max_wave_speed_W(eos, S, dim::Int)
+    A = mixed_flux_jacobian(eos, S, dim)
+    return sqrt(opnorm(A, 1) * opnorm(A, Inf))
+end
+
+# source_W(eos, S) -> SVector{6}
+#   Local DNMR relaxation source, Eq. 101's S^a_W(U) (e.g. relaxation-time-driven return to
+#   the Navier-Stokes value) — a function of local state only, no direction/gradient argument.
+function source_W(eos, S)
+    error("source_W: equations not yet supplied")
+end
+
+# ─── Path-conservative Rusanov splitting (Eq. 100), restricted to the W-sector ───────────────
+# D^∓_LR = (1/2)[N_LR ∓ α_LR ΔW]  (Eq. 100 with D_LR -> N_LR, since there's no flux term here).
+# Both N_LR and αLR are evaluated at the same freshly-recovered face-midpoint state S_mid
+# (Φ(s=1/2) generally isn't a cached cell), per Eq. 99's path integral and Eq. 104's αLR.
+@inline function path_conservative_split_W(eos, SL, SR, dim::Int)
+    CL, _, WL = SL
+    CR, _, WR = SR
+    C_mid = 0.5 * (CL + CR)
+    W_mid = 0.5 * (WL + WR)
+    ΔC = CR - CL
+    ΔW = WR - WL
+    S_mid = (C_mid, recover_primitives(C_mid, W_mid, eos), W_mid)
+
+    N_LR = path_integrand_W(eos, S_mid, ΔC, ΔW, dim)
+    # Eq. 104: αLR ≃ sqrt(‖A_eff(U*)‖_1 ‖A_eff(U*)‖_∞) at the already-computed midpoint S_mid,
+    # not max(α(U_L), α(U_R)).
+    αLR  = max_wave_speed_W(eos, S_mid, dim)
+
+    Dminus = 0.5 * (N_LR - αLR * ΔW)
+    Dplus  = 0.5 * (N_LR + αLR * ΔW)
+    return Dminus, Dplus
+end
+
+# ─── Field access for the W-sector accumulation ──────────────────────────────
+@inline dissipative_cell_W(d, I) =
+    SVector(d.bulk[I], d.pixx[I], d.pixy[I], d.piyy[I], d.nux[I], d.nuy[I])
+
+@inline function add_dissipative_W!(d, I, scale, W)
+    d.bulk[I] += scale * W[1]
+    d.pixx[I] += scale * W[2]
+    d.pixy[I] += scale * W[3]
+    d.piyy[I] += scale * W[4]
+    d.nux[I]  += scale * W[5]
+    d.nuy[I]  += scale * W[6]
+    return d
+end
+
+# ─── Face accumulation for the W-sector (Eq. 102's D^-/D^+ deposit) ──────────────────────────
+# Cannot reuse accumulate_flux_divergence!, which deposits one symmetric value with opposite
+# signs at the two faces (dU_i/dt gets ∓F/Δx); here the deposit is asymmetric — the left cell
+# of a face gets -D^-/Δx and the right cell gets -D^+/Δx, generally different values from the
+# same face (Eq. 102: dW^a_i/dt = -(1/Δx)(D^{-a}_{i+1/2}+D^{+a}_{i-1/2}) + S^a_W(U_i)) — so this
+# mirrors accumulate_flux_divergence!'s own face loop (same interior_faces/unit_vector
+# primitives from HaloArrays) with a custom two-value scatter instead.
+function accumulate_path_conservative_W!(du, u, ranges, dim, scale, eos, read_full, scatter_W!)
+    e = unit_vector(ranges, dim)
+    for IL in interior_faces(ranges, dim)
+        IR = IL + e
+        SL = read_full(u, IL)
+        SR = read_full(u, IR)
+        Dminus, Dplus = path_conservative_split_W(eos, SL, SR, dim)
+        scatter_W!(du, IL, -scale, Dminus)
+        scatter_W!(du, IR, -scale, Dplus)
+    end
+    return du
+end
+
+# ─── RHS (x then y sweep) + local source — W-sector only, isolated single-sector testing ─────
+# Standalone/self-contained like rhs_C! (own fill!(du,0.0)), mirroring its structure for
+# Eq. 102, but uses the real (non-zeroed) W-sector state from u for primitive recovery, since
+# the W-sector genuinely depends on its own current values.
+function rhs_W!(du, u, eos, dx, dy)
+    fill!(du, 0.0)
+    synchronize_halo!(u)
+    fr = FaceRanges(u)
+    d = field_storages(u)
+    prim_cache, has_W = build_primitive_cache(u, eos)
+    read_W_fn = has_W ? dissipative_cell_W : zero_dissipative_cell_W
+    read_full = (data, I) -> full_cell(data, prim_cache, I, read_W_fn)
+
+    accumulate_path_conservative_W!(field_storages(du), d, fr, 1, inv(dx), eos, read_full, add_dissipative_W!)
+    accumulate_path_conservative_W!(field_storages(du), d, fr, 2, inv(dy), eos, read_full, add_dissipative_W!)
+
+    for I in CartesianIndices(interior_range(u.bulk))
+        S = full_cell(d, prim_cache, I, read_W_fn)
+        add_dissipative_W!(field_storages(du), I, 1.0, source_W(eos, S))
+    end
+    return du
+end
+
+# ─── SSP-RK2 time step ────────────────────────────────────────────────────────
+function ssprk2_step_W!(u, u1, du, eos, dt, dx, dy)
+    rhs_W!(du, u, eos, dx, dy)
+    @. u1 = u + dt * du
+    rhs_W!(du, u1, eos, dx, dy)
+    @. u = 0.5 * u + 0.5 * (u1 + dt * du)
+    return u
+end
+
+# ─── Combined RHS: recover primitives -> C-sector fluxes/sources -> W-sector
+# path-conservative update -> combine — the actual coupled DNMR right-hand side ────────────────
+# One fill!/synchronize_halo!/FaceRanges/primitive-cache build shared by both sectors (unlike
+# rhs_C!/rhs_W!, which each do their own), so this is the RHS to hand to a solver/stepper for
+# the real coupled system, not just isolated single-sector testing. Needs init_dnmr_state's
+# 10-field grid (both sectors present) — calling this against init_ideal_state's 4-field grid
+# will error on the missing W-sector fields, same as rhs_W! already does.
+function rhs_full!(du, u, eos, dx, dy)
+    fill!(du, 0.0)
+    synchronize_halo!(u)
+    fr = FaceRanges(u)
+    d = field_storages(u)
+
+    # Step 1: recover primitives once per cell (including ghosts), cached so every flux/source
+    # evaluation below reuses them instead of re-solving the Newton problem.
+    prim_cache, has_W = build_primitive_cache(u, eos)
+    read_W_fn = has_W ? dissipative_cell_W : zero_dissipative_cell_W
+    read_full = (data, I) -> full_cell(data, prim_cache, I, read_W_fn)
+
+    # Step 2: C-sector fluxes (Rusanov flux divergence, Eq. 66-67).
+    accumulate_flux_divergence!(field_storages(du), d, fr, 1, inv(dx),
+        (SL, SR) -> rusanov_flux_C(eos, SL, SR, 1), read_full, add_conserved_C!)
+    accumulate_flux_divergence!(field_storages(du), d, fr, 2, inv(dy),
+        (SL, SR) -> rusanov_flux_C(eos, SL, SR, 2), read_full, add_conserved_C!)
+
+    # Step 3: W-sector path-conservative update (Eq. 99-100, 102).
+    accumulate_path_conservative_W!(field_storages(du), d, fr, 1, inv(dx), eos, read_full, add_dissipative_W!)
+    accumulate_path_conservative_W!(field_storages(du), d, fr, 2, inv(dy), eos, read_full, add_dissipative_W!)
+
+    # Step 4: local DNMR relaxation source for W.
+    for I in CartesianIndices(interior_range(u.bulk))
+        S = full_cell(d, prim_cache, I, read_W_fn)
+        add_dissipative_W!(field_storages(du), I, 1.0, source_W(eos, S))
+    end
+
+    # Step 5: combine — du now holds the full coupled (C,W) right-hand side, ready to be
+    # wrapped up in a solver (SSP-RK2 below, or an implicit/IMEX stepper later for the
+    # relaxation-stiff W-sector source).
+    return du
+end
+
+# ─── SSP-RK2 time step (coupled) ──────────────────────────────────────────────
+function ssprk2_step_full!(u, u1, du, eos, dt, dx, dy)
+    rhs_full!(du, u, eos, dx, dy)
+    @. u1 = u + dt * du
+    rhs_full!(du, u1, eos, dx, dy)
+    @. u = 0.5 * u + 0.5 * (u1 + dt * du)
+    return u
+end
+
+# ─── Diagnostics ──────────────────────────────────────────────────────────────
+# Mirrors cfl_dt/diagnostics in utils/finite_volume_viscous_2d.jl, adapted to the bundled
+# full_cell state and to the two grid types (ideal vs. viscous) via has_W, same pattern as
+# rhs_C!/rhs_W!/rhs_full!.
+function cfl_dt_full(u, eos, dx, dy, cfl)
+    d = field_storages(u)
+    has_W = :bulk in propertynames(u)
+    prim_cache, _ = build_primitive_cache(u, eos)
+    read_W_fn = has_W ? dissipative_cell_W : zero_dissipative_cell_W
+    amax = 0.0
+    for I in CartesianIndices(interior_range(u.C0))
+        S = full_cell(d, prim_cache, I, read_W_fn)
+        sx = has_W ? max_wave_speed_W(eos, S, 1) : max_wave_speed_C(eos, S, 1)
+        sy = has_W ? max_wave_speed_W(eos, S, 2) : max_wave_speed_C(eos, S, 2)
+        amax = max(amax, sx / dx + sy / dy)
+    end
+    return cfl / max(amax, 1.0e-14)
+end
+
+function diagnostics_full(u, eos, dx, dy)
+    d = field_storages(u)
+    has_W = :bulk in propertynames(u)
+    prim_cache, _ = build_primitive_cache(u, eos)
+    read_W_fn = has_W ? dissipative_cell_W : zero_dissipative_cell_W
+    charge = 0.0; energy = 0.0; vmax = 0.0
+    for I in CartesianIndices(interior_range(u.C0))
+        C, prim, _ = full_cell(d, prim_cache, I, read_W_fn)
+        charge += C[4] * dx * dy   # Cn
+        energy += C[1] * dx * dy   # C0
+        vmax = max(vmax, hypot(prim.vx, prim.vy))
+    end
+    return charge, energy, vmax
+end
+
+# ─── Driver: 2-D DNMR viscous hydro from (T,μ) initial data, zero initial flow/dissipation ───
+function run_2d_dnmr(eos, T_init, μ_init; cfl=0.3, t_end=0.20)
+    @assert size(T_init) == size(μ_init) "T_init and μ_init grids must have matching dimensions!"
+    n = size(T_init, 1)
+    @assert size(T_init, 2) == n "This solver assumes a square grid (n × n)!"
+
+    dx = 1.0 / n; dy = 1.0 / n
+
+    u  = init_dnmr_state(n)
+    u1 = similar(u)
+    du = similar(u)
+
+    for j in 1:n, i in 1:n
+        T = T_init[i, j]; μ = μ_init[i, j]
+        C = cons_from_prim_ideal(eos, 0.0, 0.0, log(T), μ / T)
+        interior_view(u.C0)[i, j]   = C[1]
+        interior_view(u.Cx)[i, j]   = C[2]
+        interior_view(u.Cy)[i, j]   = C[3]
+        interior_view(u.Cn)[i, j]   = C[4]
+        interior_view(u.bulk)[i, j] = 0.0
+        interior_view(u.pixx)[i, j] = 0.0
+        interior_view(u.pixy)[i, j] = 0.0
+        interior_view(u.piyy)[i, j] = 0.0
+        interior_view(u.nux)[i, j]  = 0.0
+        interior_view(u.nuy)[i, j]  = 0.0
+    end
+    synchronize_halo!(u)
+
+    q0, e0, _ = diagnostics_full(u, eos, dx, dy)
+    @printf("2-D DNMR viscous hydro — grid=%d×%d  t_end=%.2f  initial Cn=%.6f C0=%.6f\n",
+        n, n, t_end, q0, e0)
+
+    t = 0.0; step = 0
+    while t < t_end
+        dt = min(cfl_dt_full(u, eos, dx, dy, cfl), t_end - t)
+        if isnan(dt)
+            @warn "CFL timestep calculation returned NaN at step $step. Forcing minimal fallback dt."
+            dt = min(1e-4, t_end - t)
+        end
+        ssprk2_step_full!(u, u1, du, eos, dt, dx, dy)
+        t += dt; step += 1
+    end
+
+    q1, e1, vmax = diagnostics_full(u, eos, dx, dy)
+    @printf("  final  Cn=%.6f (Δ=%.2e)  C0=%.6f (Δ=%.2e)  vmax=%.4f  steps=%d\n",
+        q1, q1 - q0, e1, e1 - e0, vmax, step)
     return u
 end
